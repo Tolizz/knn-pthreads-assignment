@@ -4,10 +4,13 @@
 #include <cblas.h>
 #include <math.h>
 #include <pthread.h>
+#include <sys/time.h>
 
+#ifndef NUM_THREADS
 #define NUM_THREADS 4
+#endif
 
-// --- Βοηθητικές συναρτήσεις για τον Quick-Select ---
+// --- Helper functions for Quick-Select ---
 void swap_float(float *a, float *b) { float t = *a; *a = *b; *b = t; }
 void swap_int(int *a, int *b) { int t = *a; *a = *b; *b = t; }
 
@@ -26,7 +29,6 @@ int partition(float *arr, int *idx, int left, int right) {
     return i + 1;
 }
 
-// Βρίσκει τα k μικρότερα στοιχεία και τα τοποθετεί στις θέσεις 0 έως k-1
 void quick_select(float *arr, int *idx, int left, int right, int k) {
     if (left >= right) return;
     int pivot_index = partition(arr, idx, left, right);
@@ -44,15 +46,15 @@ typedef struct {
     int M;
     int d;
     int total_N;
-    int k;              // Πόσους γείτονες ψάχνουμε
+    int k;
     float *Q;
     float *C_block;
     float *D_block;
     float *D_full;
     float *Q_sq;
     float *C_sq;
-    float *local_k_dists;  // Πίνακας για τις k τοπικές αποστάσεις αυτού του νήματος
-    int *local_k_indices;  // Πίνακας για τους k τοπικούς δείκτες αυτού του νήματος
+    float *local_k_dists;
+    int *local_k_indices;
 } ThreadData;
 
 void generate_random_matrix(float *matrix, int rows, int cols) {
@@ -65,17 +67,16 @@ void* compute_knn_block(void* arg) {
     ThreadData *data = (ThreadData*)arg;
     int local_N = data->end_row - data->start_row;
 
-    // 1. Υπολογισμός Αποστάσεων (OpenBLAS)
+    // 1. Distance Calculation (OpenBLAS)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 data->M, local_N, data->d,
                 -2.0f, data->Q, data->d,
                 data->C_block, data->d,
                 0.0f, data->D_block, data->total_N);
 
-    // Βοηθητικός πίνακας δεικτών για τον quick-select (τον φτιάχνουμε μία φορά ανά νήμα)
     int *indices = (int *)malloc(local_N * sizeof(int));
 
-    // 2. Ολοκλήρωση εξίσωσης και εύρεση τοπικών k γειτόνων για κάθε Query
+    // 2. Equation completion and finding local k neighbors
     for (int i = 0; i < data->M; i++) {
         for (int j = 0; j < local_N; j++) {
             int global_j = data->start_row + j;
@@ -85,17 +86,14 @@ void* compute_knn_block(void* arg) {
             if (data->D_full[index] < 0) data->D_full[index] = 0;
             data->D_full[index] = sqrt(data->D_full[index]);
             
-            indices[j] = global_j; // Αποθήκευση του αρχικού δείκτη
+            indices[j] = global_j;
         }
 
-        // Τρέχουμε quick-select ΜΟΝΟ στο κομμάτι που υπολόγισε αυτό το νήμα
         float *current_row_dists = data->D_full + (i * data->total_N) + data->start_row;
-        
-        // Ψάχνουμε τα k μικρότερα (ή local_N αν το k είναι μεγαλύτερο από το μπλοκ)
         int elements_to_find = (data->k < local_N) ? data->k : local_N;
+        
         quick_select(current_row_dists, indices, 0, local_N - 1, elements_to_find);
 
-        // Αποθήκευση των τοπικών k γειτόνων στους κοινούς πίνακες επιστροφής
         for (int x = 0; x < elements_to_find; x++) {
             int out_idx = (i * NUM_THREADS * data->k) + (data->thread_id * data->k) + x;
             data->local_k_dists[out_idx] = current_row_dists[x];
@@ -110,10 +108,11 @@ void* compute_knn_block(void* arg) {
 int main() {
     srand(time(NULL));
 
-    int N = 4000; 
-    int M = 50;   
-    int d = 128;  
-    int k = 5;    // Θέλουμε τους 5 πιο κοντινούς γείτονες
+    // --- PARAMETERS (Stress Test) ---
+    int N = 100000; // Corpus points
+    int M = 100;    // Query points
+    int d = 128;    // Dimensions
+    int k = 10;     // Number of nearest neighbors
 
     float *C = (float *)malloc(N * d * sizeof(float));
     float *Q = (float *)malloc(M * d * sizeof(float));
@@ -125,6 +124,7 @@ int main() {
     float *C_sq = (float *)calloc(N, sizeof(float));
     float *Q_sq = (float *)calloc(M, sizeof(float));
 
+    // Calculate squared norms
     for(int i = 0; i < N; i++) {
         for(int j = 0; j < d; j++) C_sq[i] += C[i * d + j] * C[i * d + j];
     }
@@ -132,16 +132,16 @@ int main() {
         for(int j = 0; j < d; j++) Q_sq[i] += Q[i * d + j] * Q[i * d + j];
     }
 
-    // Πίνακες για να μαζέψουμε τα τοπικά αποτελέσματα από τα νήματα
-    // Μέγεθος: M queries * NUM_THREADS * k γείτονες
     float *all_local_dists = (float *)malloc(M * NUM_THREADS * k * sizeof(float));
     int *all_local_indices = (int *)malloc(M * NUM_THREADS * k * sizeof(int));
 
-    // --- ΕΝΑΡΞΗ PTHREADS ---
     pthread_t threads[NUM_THREADS];
     ThreadData thread_data[NUM_THREADS];
-
     int block_size = N / NUM_THREADS;
+
+    // --- START PTHREADS TIMER ---
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
 
     for (int t = 0; t < NUM_THREADS; t++) {
         thread_data[t].thread_id = t;
@@ -166,27 +166,24 @@ int main() {
     for (int t = 0; t < NUM_THREADS; t++) {
         pthread_join(threads[t], NULL);
     }
-    // --- ΛΗΞΗ PTHREADS ---
 
-    // --- ΒΗΜΑ ΣΥΓΧΩΝΕΥΣΗΣ (MERGE) ---
-    // Τώρα έχουμε NUM_THREADS * k υποψήφιους γείτονες για κάθε query.
-    // Πρέπει να βρούμε τους τελικούς k.
-    printf("\nΈνωση αποτελεσμάτων και εύρεση των %d τελικών γειτόνων...\n", k);
+    // --- MERGE ---
     for (int i = 0; i < M; i++) {
         int candidates_count = NUM_THREADS * k;
         float *query_candidates_dists = all_local_dists + (i * candidates_count);
         int *query_candidates_indices = all_local_indices + (i * candidates_count);
 
         quick_select(query_candidates_dists, query_candidates_indices, 0, candidates_count - 1, k);
-        
-        // Εκτύπωση για επαλήθευση (για το πρώτο query μόνο, για να μη γεμίσει η οθόνη)
-        if (i == 0) {
-            printf("Για το Query 0, οι %d πιο κοντινοί γείτονες είναι:\n", k);
-            for (int x = 0; x < k; x++) {
-                printf(" - Σημείο %d (Απόσταση: %f)\n", query_candidates_indices[x], query_candidates_dists[x]);
-            }
-        }
     }
+
+    // --- END TIMER ---
+    gettimeofday(&end, NULL);
+    
+    double elapsed_time = (end.tv_sec - start.tv_sec) + 
+                          (end.tv_usec - start.tv_usec) / 1000000.0;
+
+    printf("k-NN calculation completed with %d threads.\n", NUM_THREADS);
+    printf("Total Execution Time (Pthreads + Merge): %.4f seconds\n", elapsed_time);
 
     free(C); free(Q); free(D); free(C_sq); free(Q_sq);
     free(all_local_dists); free(all_local_indices);
