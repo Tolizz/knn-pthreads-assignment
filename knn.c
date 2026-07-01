@@ -5,22 +5,54 @@
 #include <math.h>
 #include <pthread.h>
 
-#define NUM_THREADS 4 // Μπορείς να το αλλάξεις ανάλογα με τους πυρήνες του υπολογιστή σου
+#define NUM_THREADS 4
 
-// Δομή για να περνάμε τα ορίσματα στο κάθε νήμα
+// --- Βοηθητικές συναρτήσεις για τον Quick-Select ---
+void swap_float(float *a, float *b) { float t = *a; *a = *b; *b = t; }
+void swap_int(int *a, int *b) { int t = *a; *a = *b; *b = t; }
+
+int partition(float *arr, int *idx, int left, int right) {
+    float pivot = arr[right];
+    int i = left - 1;
+    for (int j = left; j < right; j++) {
+        if (arr[j] <= pivot) {
+            i++;
+            swap_float(&arr[i], &arr[j]);
+            swap_int(&idx[i], &idx[j]);
+        }
+    }
+    swap_float(&arr[i + 1], &arr[right]);
+    swap_int(&idx[i + 1], &idx[right]);
+    return i + 1;
+}
+
+// Βρίσκει τα k μικρότερα στοιχεία και τα τοποθετεί στις θέσεις 0 έως k-1
+void quick_select(float *arr, int *idx, int left, int right, int k) {
+    if (left >= right) return;
+    int pivot_index = partition(arr, idx, left, right);
+    int count = pivot_index - left + 1;
+    if (count == k) return;
+    if (count > k) quick_select(arr, idx, left, pivot_index - 1, k);
+    else quick_select(arr, idx, pivot_index + 1, right, k - count);
+}
+// --------------------------------------------------
+
 typedef struct {
     int thread_id;
     int start_row;
     int end_row;
-    int M;           // Αριθμός Queries
-    int d;           // Διαστάσεις
-    int total_N;     // Το συνολικό N (απαραίτητο για το offset του D)
+    int M;
+    int d;
+    int total_N;
+    int k;              // Πόσους γείτονες ψάχνουμε
     float *Q;
-    float *C_block;  // Δείκτης στο σημείο εκκίνησης του C για αυτό το thread
-    float *D_block;  // Δείκτης στο σημείο εκκίνησης του D για αυτό το thread
-    float *D_full;   // Ολόκληρος ο πίνακας D
+    float *C_block;
+    float *D_block;
+    float *D_full;
     float *Q_sq;
     float *C_sq;
+    float *local_k_dists;  // Πίνακας για τις k τοπικές αποστάσεις αυτού του νήματος
+    int *local_k_indices;  // Πίνακας για τους k τοπικούς δείκτες αυτού του νήματος
 } ThreadData;
 
 void generate_random_matrix(float *matrix, int rows, int cols) {
@@ -29,46 +61,59 @@ void generate_random_matrix(float *matrix, int rows, int cols) {
     }
 }
 
-// Η συνάρτηση που εκτελεί το κάθε νήμα
 void* compute_knn_block(void* arg) {
     ThreadData *data = (ThreadData*)arg;
-    int local_N = data->end_row - data->start_row; // Πόσα σημεία αναλαμβάνει το νήμα
+    int local_N = data->end_row - data->start_row;
 
-    printf("Νήμα %d: Υπολογισμός σημείων από %d έως %d...\n", 
-           data->thread_id, data->start_row, data->end_row - 1);
-
-    // 1. Πολλαπλασιασμός Μητρώων: D_block = -2 * Q * C_block^T
+    // 1. Υπολογισμός Αποστάσεων (OpenBLAS)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 data->M, local_N, data->d,
                 -2.0f, data->Q, data->d,
                 data->C_block, data->d,
-                0.0f, data->D_block, data->total_N); // Προσοχή: Το ldc είναι το total_N
+                0.0f, data->D_block, data->total_N);
 
-    // 2. Ολοκλήρωση της Εξίσωσης: Τετράγωνα και Ρίζα
+    // Βοηθητικός πίνακας δεικτών για τον quick-select (τον φτιάχνουμε μία φορά ανά νήμα)
+    int *indices = (int *)malloc(local_N * sizeof(int));
+
+    // 2. Ολοκλήρωση εξίσωσης και εύρεση τοπικών k γειτόνων για κάθε Query
     for (int i = 0; i < data->M; i++) {
         for (int j = 0; j < local_N; j++) {
-            // Ο πραγματικός δείκτης j σε σχέση με ολόκληρο τον πίνακα
-            int global_j = data->start_row + j; 
-            
-            // Η ακριβής θέση στον μονοδιάστατο πίνακα D
-            int index = i * data->total_N + global_j; 
+            int global_j = data->start_row + j;
+            int index = i * data->total_N + global_j;
             
             data->D_full[index] += data->Q_sq[i] + data->C_sq[global_j];
-            
             if (data->D_full[index] < 0) data->D_full[index] = 0;
             data->D_full[index] = sqrt(data->D_full[index]);
+            
+            indices[j] = global_j; // Αποθήκευση του αρχικού δείκτη
+        }
+
+        // Τρέχουμε quick-select ΜΟΝΟ στο κομμάτι που υπολόγισε αυτό το νήμα
+        float *current_row_dists = data->D_full + (i * data->total_N) + data->start_row;
+        
+        // Ψάχνουμε τα k μικρότερα (ή local_N αν το k είναι μεγαλύτερο από το μπλοκ)
+        int elements_to_find = (data->k < local_N) ? data->k : local_N;
+        quick_select(current_row_dists, indices, 0, local_N - 1, elements_to_find);
+
+        // Αποθήκευση των τοπικών k γειτόνων στους κοινούς πίνακες επιστροφής
+        for (int x = 0; x < elements_to_find; x++) {
+            int out_idx = (i * NUM_THREADS * data->k) + (data->thread_id * data->k) + x;
+            data->local_k_dists[out_idx] = current_row_dists[x];
+            data->local_k_indices[out_idx] = indices[x];
         }
     }
 
+    free(indices);
     return NULL;
 }
 
 int main() {
     srand(time(NULL));
 
-    int N = 4000; // Corpus (C) - Το αυξήσαμε λίγο για να φανεί η δουλειά των νημάτων
-    int M = 50;   // Queries (Q)
-    int d = 128;  // Διαστάσεις
+    int N = 4000; 
+    int M = 50;   
+    int d = 128;  
+    int k = 5;    // Θέλουμε τους 5 πιο κοντινούς γείτονες
 
     float *C = (float *)malloc(N * d * sizeof(float));
     float *Q = (float *)malloc(M * d * sizeof(float));
@@ -80,14 +125,17 @@ int main() {
     float *C_sq = (float *)calloc(N, sizeof(float));
     float *Q_sq = (float *)calloc(M, sizeof(float));
 
-    // Υπολογισμός τετραγώνων (Γίνεται σειριακά γιατί είναι πολύ γρήγορο, 
-    // αλλά θα μπορούσε να μπει και στα νήματα)
     for(int i = 0; i < N; i++) {
         for(int j = 0; j < d; j++) C_sq[i] += C[i * d + j] * C[i * d + j];
     }
     for(int i = 0; i < M; i++) {
         for(int j = 0; j < d; j++) Q_sq[i] += Q[i * d + j] * Q[i * d + j];
     }
+
+    // Πίνακες για να μαζέψουμε τα τοπικά αποτελέσματα από τα νήματα
+    // Μέγεθος: M queries * NUM_THREADS * k γείτονες
+    float *all_local_dists = (float *)malloc(M * NUM_THREADS * k * sizeof(float));
+    int *all_local_indices = (int *)malloc(M * NUM_THREADS * k * sizeof(int));
 
     // --- ΕΝΑΡΞΗ PTHREADS ---
     pthread_t threads[NUM_THREADS];
@@ -98,34 +146,50 @@ int main() {
     for (int t = 0; t < NUM_THREADS; t++) {
         thread_data[t].thread_id = t;
         thread_data[t].start_row = t * block_size;
-        
-        // Το τελευταίο νήμα παίρνει και τυχόν υπόλοιπα αν το N δεν διαιρείται ακριβώς
         thread_data[t].end_row = (t == NUM_THREADS - 1) ? N : (t + 1) * block_size;
-        
         thread_data[t].M = M;
         thread_data[t].d = d;
         thread_data[t].total_N = N;
+        thread_data[t].k = k;
         thread_data[t].Q = Q;
-        thread_data[t].C_block = C + (thread_data[t].start_row * d); // Μετατόπιση δείκτη στο C
-        thread_data[t].D_block = D + thread_data[t].start_row;       // Μετατόπιση δείκτη στο D
+        thread_data[t].C_block = C + (thread_data[t].start_row * d);
+        thread_data[t].D_block = D + thread_data[t].start_row;
         thread_data[t].D_full = D;
         thread_data[t].Q_sq = Q_sq;
         thread_data[t].C_sq = C_sq;
+        thread_data[t].local_k_dists = all_local_dists;
+        thread_data[t].local_k_indices = all_local_indices;
 
-        // Δημιουργία και εκτέλεση νήματος
         pthread_create(&threads[t], NULL, compute_knn_block, (void*)&thread_data[t]);
     }
 
-    // Αναμονή όλων των νημάτων να τελειώσουν
     for (int t = 0; t < NUM_THREADS; t++) {
         pthread_join(threads[t], NULL);
     }
     // --- ΛΗΞΗ PTHREADS ---
 
-    printf("\nΟ παράλληλος υπολογισμός των αποστάσεων ολοκληρώθηκε επιτυχώς με %d νήματα!\n", NUM_THREADS);
+    // --- ΒΗΜΑ ΣΥΓΧΩΝΕΥΣΗΣ (MERGE) ---
+    // Τώρα έχουμε NUM_THREADS * k υποψήφιους γείτονες για κάθε query.
+    // Πρέπει να βρούμε τους τελικούς k.
+    printf("\nΈνωση αποτελεσμάτων και εύρεση των %d τελικών γειτόνων...\n", k);
+    for (int i = 0; i < M; i++) {
+        int candidates_count = NUM_THREADS * k;
+        float *query_candidates_dists = all_local_dists + (i * candidates_count);
+        int *query_candidates_indices = all_local_indices + (i * candidates_count);
 
-    free(C); free(Q); free(D);
-    free(C_sq); free(Q_sq);
+        quick_select(query_candidates_dists, query_candidates_indices, 0, candidates_count - 1, k);
+        
+        // Εκτύπωση για επαλήθευση (για το πρώτο query μόνο, για να μη γεμίσει η οθόνη)
+        if (i == 0) {
+            printf("Για το Query 0, οι %d πιο κοντινοί γείτονες είναι:\n", k);
+            for (int x = 0; x < k; x++) {
+                printf(" - Σημείο %d (Απόσταση: %f)\n", query_candidates_indices[x], query_candidates_dists[x]);
+            }
+        }
+    }
+
+    free(C); free(Q); free(D); free(C_sq); free(Q_sq);
+    free(all_local_dists); free(all_local_indices);
 
     return 0;
 }
