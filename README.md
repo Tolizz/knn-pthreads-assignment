@@ -20,7 +20,7 @@ sudo apt-get install libopenblas-dev
 **1. Κλωνοποίηση του αποθετηρίου:**
 
 ```bash
-git clone [https://github.com/Tolizz/knn-pthreads-assignment.git](https://github.com/Tolizz/knn-pthreads-assignment.git)
+git clone https://github.com/Tolizz/knn-pthreads-assignment.git
 cd knn-pthreads-assignment
 
 ```
