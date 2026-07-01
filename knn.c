@@ -110,7 +110,7 @@ int main() {
 
     // --- PARAMETERS (Stress Test) ---
     int N = 100000; // Corpus points
-    int M = 100;    // Query points
+    int M = 1000;   // Query points (Αυξήθηκε για να φανεί ο παραλληλισμός)
     int d = 128;    // Dimensions
     int k = 10;     // Number of nearest neighbors
 
